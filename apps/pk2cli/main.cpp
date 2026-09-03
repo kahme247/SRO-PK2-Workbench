@@ -31,7 +31,8 @@ void usage() {
         << "  pk2cli extract-all <archive.pk2> <out-dir> [--overwrite] [--password=169841]\n"
         << "  pk2cli import-file <archive.pk2> <source-file> <archive-path> <out.pk2> [--password=169841]\n"
         << "  pk2cli import-folder <archive.pk2> <source-dir> <archive-path> <out.pk2> [--password=169841]\n"
-        << "  pk2cli delete <archive.pk2> <archive-path> <out.pk2> [--password=169841]\n";
+        << "  pk2cli delete <archive.pk2> <archive-path> <out.pk2> [--password=169841]\n"
+        << "  pk2cli defragment <archive.pk2> [out.pk2] [--password=169841]\n";
 }
 
 std::uint32_t readLe32(const std::uint8_t* bytes) {
@@ -370,6 +371,22 @@ int main(int argc, char** argv) {
             archive.deleteEntry(args[1]);
             archive.saveAs(fs::path(args[2]));
             std::cout << "Deleted entry and saved " << args[2] << '\n';
+            return 0;
+        }
+
+        if (command == "defragment") {
+            if (args.size() != 1 && args.size() != 2) {
+                usage();
+                return 1;
+            }
+            auto archive = pk2::Pk2Archive::open(fs::path(args[0]), options.password);
+            if (args.size() == 2) {
+                archive.saveAs(fs::path(args[1]));
+                std::cout << "Defragmented and saved to " << args[1] << '\n';
+            } else {
+                archive.saveDefragmented();
+                std::cout << "Defragmented and saved " << args[0] << '\n';
+            }
             return 0;
         }
 

@@ -8,11 +8,13 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <ole2.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <uxtheme.h>
 
 #include <algorithm>
 #include <cctype>
@@ -28,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <fstream>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -50,6 +53,9 @@ pk2::Pk2Archive gArchive;
 bool gLoaded = false;
 bool gBusy = false;
 std::string gCurrentFolder;
+int gTreeWidth = 260;
+bool gDraggingSplitter = false;
+WNDPROC gOriginalSearchProc = nullptr;
 
 constexpr UINT WM_APP_OPEN_COMPLETE = WM_APP + 1;
 constexpr UINT WM_APP_TASK_PROGRESS = WM_APP + 2;
@@ -91,7 +97,7 @@ HGLOBAL createDropEffectGlobal(DWORD effect) {
 constexpr const wchar_t* kAppTitle = L"PK2 Workbench PRO - by kahme247";
 constexpr const wchar_t* kAppTitlePrefix = L"PK2 Workbench PRO";
 constexpr const wchar_t* kAppCredit = L"by kahme247";
-constexpr const wchar_t* kAppVersion = L"0.3.0";
+constexpr const wchar_t* kAppVersion = L"0.3.1";
 
 std::wstring absolutePathWide(const fs::path& path) {
     const auto input = path.wstring();
@@ -517,6 +523,7 @@ void setBusy(bool busy, const std::wstring& statusText) {
         EnableMenuItem(menu, IDM_IMPORT_FOLDER, MF_BYCOMMAND | enabled);
         EnableMenuItem(menu, IDM_DELETE_ENTRY, MF_BYCOMMAND | enabled);
         EnableMenuItem(menu, IDM_TOOLS_SERVER_CONFIG, MF_BYCOMMAND | enabled);
+        EnableMenuItem(menu, IDM_TOOLS_DEFRAGMENT, MF_BYCOMMAND | enabled);
         DrawMenuBar(gMain);
     }
 
@@ -932,6 +939,33 @@ std::wstring archiveSummary() {
     return summary.str();
 }
 
+int getIconIndex(const std::wstring& name, bool isFolder) {
+    SHFILEINFOW sfi{};
+    DWORD flags = SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX | SHGFI_SMALLICON;
+    DWORD attrs = isFolder ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+    if (SHGetFileInfoW(name.c_str(), attrs, &sfi, sizeof(sfi), flags)) {
+        return sfi.iIcon;
+    }
+    return 0;
+}
+
+void copyTextToClipboard(const std::wstring& text) {
+    if (OpenClipboard(gMain)) {
+        EmptyClipboard();
+        const auto bytes = (text.size() + 1) * sizeof(wchar_t);
+        auto hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hMem != nullptr) {
+            auto* p = GlobalLock(hMem);
+            if (p != nullptr) {
+                memcpy(p, text.c_str(), bytes);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_UNICODETEXT, hMem);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
 void addDummyChild(HTREEITEM parent) {
     TVINSERTSTRUCTW insert{};
     insert.hParent = parent;
@@ -956,9 +990,11 @@ void insertFolderTreeItems(HTREEITEM parent, const std::string& folderPath, bool
         TVINSERTSTRUCTW insert{};
         insert.hParent = parent;
         insert.hInsertAfter = TVI_LAST;
-        insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+        insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
         insert.item.pszText = const_cast<wchar_t*>(name.c_str());
         insert.item.lParam = reinterpret_cast<LPARAM>(new std::string(entry.path));
+        insert.item.iImage = getIconIndex(L"folder", true);
+        insert.item.iSelectedImage = insert.item.iImage;
         const auto item = TreeView_InsertItem(gTree, &insert);
         if (oneLevelOnly) {
             if (hasFolderChildren(entry.path)) {
@@ -982,9 +1018,11 @@ void insertRootFilesTreeItem(HTREEITEM parent) {
     TVINSERTSTRUCTW insert{};
     insert.hParent = parent;
     insert.hInsertAfter = TVI_LAST;
-    insert.item.mask = TVIF_TEXT | TVIF_PARAM;
+    insert.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
     insert.item.pszText = const_cast<wchar_t*>(text.c_str());
     insert.item.lParam = reinterpret_cast<LPARAM>(new std::string());
+    insert.item.iImage = getIconIndex(L"file.txt", false);
+    insert.item.iSelectedImage = insert.item.iImage;
     TreeView_InsertItem(gTree, &insert);
 }
 
@@ -993,9 +1031,11 @@ void populateTree() {
     TVINSERTSTRUCTW root{};
     root.hParent = TVI_ROOT;
     root.hInsertAfter = TVI_ROOT;
-    root.item.mask = TVIF_TEXT | TVIF_PARAM;
+    root.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_IMAGE | TVIF_SELECTEDIMAGE;
     root.item.pszText = const_cast<wchar_t*>(L"[root]");
     root.item.lParam = reinterpret_cast<LPARAM>(new std::string());
+    root.item.iImage = getIconIndex(L"folder", true);
+    root.item.iSelectedImage = root.item.iImage;
     const auto rootItem = TreeView_InsertItem(gTree, &root);
     insertFolderTreeItems(rootItem, "", true);
     insertRootFilesTreeItem(rootItem);
@@ -1020,9 +1060,11 @@ void populateList(const std::string& folderPath) {
     for (const auto& entry : gArchive.children(folderPath)) {
         const auto name = toWide(entry.name);
         LVITEMW item{};
-        item.mask = LVIF_TEXT;
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
         item.iItem = row;
         item.pszText = const_cast<wchar_t*>(name.c_str());
+        item.iImage = getIconIndex(entry.type == pk2::EntryType::Folder ? L"folder" : name,
+                                   entry.type == pk2::EntryType::Folder);
         ListView_InsertItem(gList, &item);
 
         const auto type = entry.type == pk2::EntryType::Folder ? L"Folder" : L"File";
@@ -1441,6 +1483,35 @@ void saveArchive(bool saveAs) {
     }
 }
 
+void defragmentArchive() {
+    if (gBusy) {
+        setStatus(L"Please wait for the current operation to finish.");
+        return;
+    }
+    if (!gLoaded || gArchive.sourcePath().empty()) {
+        setStatus(L"No PK2 loaded.");
+        return;
+    }
+    if (MessageBoxW(gMain,
+                    L"Defragmenting will repack the entire PK2 archive to remove slack space and minimize file size.\n\n"
+                    L"Do you want to proceed?",
+                    L"Defragment PK2",
+                    MB_ICONQUESTION | MB_YESNO) != IDYES) {
+        return;
+    }
+    setStatus(L"Defragmenting PK2...");
+    try {
+        gArchive.saveDefragmented();
+        setStatus(L"PK2 successfully defragmented and optimized.");
+        populateTree();
+        populateList(gCurrentFolder);
+        updateTitle();
+        MessageBoxW(gMain, L"PK2 archive successfully defragmented and optimized!", L"Defragment PK2", MB_ICONINFORMATION);
+    } catch (const std::exception& ex) {
+        showError(ex);
+    }
+}
+
 void extractPath(const std::string& path, bool recurse, bool wrapInArchiveFolder) {
     if (gBusy) {
         setStatus(L"Please wait for the current operation to finish.");
@@ -1542,13 +1613,13 @@ bool equalsAsciiInsensitive(std::string_view left, std::string_view right) {
            });
 }
 
-std::string rootConfigPath(std::string_view fileName) {
+std::optional<std::string> findRootConfigPath(std::string_view fileName) {
     for (const auto& entry : gArchive.children("")) {
         if (entry.type == pk2::EntryType::File && equalsAsciiInsensitive(entry.name, fileName)) {
             return entry.path;
         }
     }
-    throw pk2::Pk2Error("This PK2 does not contain root-level " + std::string(fileName) + ".");
+    return std::nullopt;
 }
 
 void editServerConfiguration() {
@@ -1562,13 +1633,30 @@ void editServerConfiguration() {
     }
 
     try {
-        const auto divisionPath = rootConfigPath("DIVISIONINFO.TXT");
-        const auto portPath = rootConfigPath("GATEPORT.TXT");
-        const auto versionPath = rootConfigPath("SV.T");
+        const auto divisionPath = findRootConfigPath("DIVISIONINFO.TXT");
+        const auto portPath = findRootConfigPath("GATEPORT.TXT");
+        auto versionPath = findRootConfigPath("SV.T");
+        if (!versionPath) versionPath = findRootConfigPath("SV.TXT");
+        if (!versionPath) versionPath = findRootConfigPath("version.txt");
+
+        std::vector<std::uint8_t> divisionBytes;
+        if (divisionPath) {
+            divisionBytes = gArchive.readFile(*divisionPath);
+        }
+
+        std::vector<std::uint8_t> portBytes;
+        if (portPath) {
+            portBytes = gArchive.readFile(*portPath);
+        }
+
+        std::vector<std::uint8_t> versionBytes;
+        if (versionPath) {
+            versionBytes = gArchive.readFile(*versionPath);
+        }
+
         ServerConfigDialogState state;
-        state.config = pk2::parseServerConfig(gArchive.readFile(divisionPath),
-                                               gArchive.readFile(portPath),
-                                               gArchive.readFile(versionPath));
+        state.config = pk2::parseServerConfig(divisionBytes, portBytes, versionBytes);
+
         const auto result = DialogBoxParamW(gInstance,
                                             MAKEINTRESOURCEW(IDD_SERVER_CONFIG),
                                             gMain,
@@ -1578,12 +1666,17 @@ void editServerConfiguration() {
             return;
         }
 
-        auto divisionBytes = pk2::serializeDivisionInfo(state.config);
-        auto portBytes = pk2::serializeGatePort(state.config);
-        auto versionBytes = pk2::serializeServerVersion(state.config);
-        gArchive.importFileBytes(std::move(divisionBytes), divisionPath);
-        gArchive.importFileBytes(std::move(portBytes), portPath);
-        gArchive.importFileBytes(std::move(versionBytes), versionPath);
+        auto divisionOut = pk2::serializeDivisionInfo(state.config);
+        auto portOut = pk2::serializeGatePort(state.config);
+        auto versionOut = pk2::serializeServerVersion(state.config);
+
+        gArchive.importFileBytes(std::move(divisionOut),
+                                divisionPath.value_or("DIVISIONINFO.TXT"));
+        gArchive.importFileBytes(std::move(portOut),
+                                portPath.value_or("GATEPORT.TXT"));
+        gArchive.importFileBytes(std::move(versionOut),
+                                versionPath.value_or("SV.T"));
+
         gArchive.save();
         populateTree();
         populateList(validRefreshFolder(gCurrentFolder));
@@ -1630,9 +1723,11 @@ void populateSearchResults() {
 
         const auto name = toWide(entry.name);
         LVITEMW item{};
-        item.mask = LVIF_TEXT;
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
         item.iItem = row;
         item.pszText = const_cast<wchar_t*>(name.c_str());
+        item.iImage = getIconIndex(entry.type == pk2::EntryType::Folder ? L"folder" : name,
+                                   entry.type == pk2::EntryType::Folder);
         ListView_InsertItem(gList, &item);
         const auto type = entry.type == pk2::EntryType::Folder ? L"Folder" : L"File";
         ListView_SetItemText(gList, row, 1, const_cast<wchar_t*>(type));
@@ -1643,8 +1738,163 @@ void populateSearchResults() {
         ++row;
     }
     std::wostringstream status;
-    status << row << L" search result" << (row == 1 ? L"." : L"s.");
+    status << L"Found " << row << L" matching item" << (row == 1 ? L"." : L"s.");
     setStatus(status.str());
+}
+
+LRESULT CALLBACK searchEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) {
+            if (gLoaded) {
+                populateSearchResults();
+            }
+            return 0;
+        } else if (wParam == VK_ESCAPE) {
+            SetWindowTextW(hwnd, L"");
+            if (gLoaded) {
+                populateList(gCurrentFolder);
+            }
+            return 0;
+        }
+    }
+    return CallWindowProcW(gOriginalSearchProc, hwnd, uMsg, wParam, lParam);
+}
+
+bool isTextEntry(const pk2::EntryInfo& entry);
+
+void showTreeContextMenu(HWND treeHwnd, int screenX, int screenY) {
+    if (!gLoaded || gBusy) return;
+
+    TVHITTESTINFO ht{};
+    POINT pt = {screenX, screenY};
+    ScreenToClient(treeHwnd, &pt);
+    ht.pt = pt;
+    HTREEITEM hitItem = TreeView_HitTest(treeHwnd, &ht);
+    if (hitItem != nullptr) {
+        TreeView_SelectItem(treeHwnd, hitItem);
+    }
+    const auto selected = selectedArchivePath();
+    if (!selected) return;
+
+    const auto info = gArchive.find(*selected);
+    const bool isRoot = selected->empty();
+    const bool isFolder = isRoot || (info && info->type == pk2::EntryType::Folder);
+
+    HMENU menu = CreatePopupMenu();
+    if (isFolder) {
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EXTRACT, L"&Extract Folder...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_IMPORT_FILE, L"&Import File Here...");
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_IMPORT_FOLDER, L"Import &Folder Here...");
+        if (!isRoot) {
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, IDM_CONTEXT_COPY_PATH, L"&Copy Archive Path");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, IDM_CONTEXT_DELETE, L"&Delete Folder\tDel");
+        }
+    } else {
+        if (info && isTextEntry(*info)) {
+            AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EDIT, L"&Edit Text File...\tDouble-Click");
+            SetMenuDefaultItem(menu, IDM_CONTEXT_EDIT, FALSE);
+        }
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EXTRACT, L"&Extract File...");
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_REPLACE, L"&Replace / Import File...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_COPY_PATH, L"&Copy Archive Path");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_DELETE, L"&Delete File\tDel");
+    }
+
+    SetForegroundWindow(gMain);
+    TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN, screenX, screenY, gMain, nullptr);
+    DestroyMenu(menu);
+}
+
+void showListContextMenu(HWND listHwnd, int screenX, int screenY) {
+    if (!gLoaded || gBusy) return;
+
+    LVHITTESTINFO ht{};
+    POINT pt = {screenX, screenY};
+    ScreenToClient(listHwnd, &pt);
+    ht.pt = pt;
+    int hitItem = ListView_HitTest(listHwnd, &ht);
+    if (hitItem >= 0) {
+        ListView_SetItemState(listHwnd, hitItem, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+
+    const auto selected = selectedArchivePath();
+    if (!selected) return;
+
+    const auto info = gArchive.find(*selected);
+    if (!info) return;
+
+    HMENU menu = CreatePopupMenu();
+    if (info->type == pk2::EntryType::File) {
+        if (isTextEntry(*info)) {
+            AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EDIT, L"&Edit Text File...\tDouble-Click");
+            SetMenuDefaultItem(menu, IDM_CONTEXT_EDIT, FALSE);
+        }
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EXTRACT, L"&Extract File...");
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_REPLACE, L"&Replace / Import File...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_COPY_PATH, L"&Copy Archive Path");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_DELETE, L"&Delete File\tDel");
+    } else {
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_EXTRACT, L"&Extract Folder...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_IMPORT_FILE, L"&Import File Here...");
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_IMPORT_FOLDER, L"Import &Folder Here...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_COPY_PATH, L"&Copy Archive Path");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, IDM_CONTEXT_DELETE, L"&Delete Folder\tDel");
+    }
+
+    SetForegroundWindow(gMain);
+    TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN, screenX, screenY, gMain, nullptr);
+    DestroyMenu(menu);
+}
+
+void importFileIntoFolder(const std::string& targetFolder) {
+    if (gBusy || !gLoaded) return;
+    try {
+        const auto file = openFileDialog(L"Import File", L"All files\0*.*\0", false);
+        if (!file) return;
+        startImportPaths({*file}, targetFolder);
+    } catch (const std::exception& ex) {
+        showError(ex);
+    }
+}
+
+void importFolderIntoFolder(const std::string& targetFolder) {
+    if (gBusy || !gLoaded) return;
+    try {
+        const auto folder = browseFolder(L"Choose folder to import");
+        if (!folder) return;
+        startImportPaths({*folder}, targetFolder);
+    } catch (const std::exception& ex) {
+        showError(ex);
+    }
+}
+
+void importFileOver(const std::string& targetFilePath) {
+    if (gBusy || !gLoaded) return;
+    try {
+        const auto file = openFileDialog(L"Replace File", L"All files\0*.*\0", false);
+        if (!file) return;
+        std::ifstream in(*file, std::ios::binary);
+        if (!in) throw pk2::Pk2Error("Could not open replacement file: " + pk2::pathUtf8(*file));
+        std::vector<std::uint8_t> newBytes((std::istreambuf_iterator<char>(in)),
+                                           std::istreambuf_iterator<char>());
+        gArchive.importFileBytes(std::move(newBytes), targetFilePath);
+        gArchive.save();
+        populateList(gCurrentFolder);
+        updateTitle();
+        setStatus(L"Replaced and saved: " + toWide(targetFilePath));
+    } catch (const std::exception& ex) {
+        showError(ex);
+    }
 }
 
 void showMd5Helper() {
@@ -1852,22 +2102,22 @@ void editTextEntry(const pk2::EntryInfo& entry) {
 
 void createControls(HWND window) {
     gTree = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
-                            WS_CHILD | WS_VISIBLE | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT,
+                            WS_CHILD | WS_VISIBLE | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_TRACKSELECT,
                             0, 0, 0, 0, window, reinterpret_cast<HMENU>(IDC_TREE), gInstance, nullptr);
     gList = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-                            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS,
                             0, 0, 0, 0, window, reinterpret_cast<HMENU>(IDC_LIST), gInstance, nullptr);
     gSearch = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                               WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
                               0, 0, 0, 0, window, reinterpret_cast<HMENU>(IDC_SEARCH), gInstance, nullptr);
     SendMessageW(gSearch, EM_SETCUEBANNER, TRUE,
-                 reinterpret_cast<LPARAM>(L"Search files and folders inside the PK2..."));
+                 reinterpret_cast<LPARAM>(L"Search files and folders inside the PK2... (Enter to search, Esc to clear)"));
     gSearchButton = CreateWindowExW(0, L"BUTTON", L"Search",
                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                                     0, 0, 0, 0, window,
                                     reinterpret_cast<HMENU>(IDC_SEARCH_BUTTON), gInstance, nullptr);
     gStatus = CreateWindowExW(0, STATUSCLASSNAMEW, L"",
-                              WS_CHILD | WS_VISIBLE, 0, 0, 0, 0,
+                              WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0,
                               window, reinterpret_cast<HMENU>(IDC_STATUS), gInstance, nullptr);
     gProgress = CreateWindowExW(0, PROGRESS_CLASSW, L"",
                                 WS_CHILD | PBS_SMOOTH,
@@ -1878,7 +2128,22 @@ void createControls(HWND window) {
                                 nullptr);
     SendMessageW(gProgress, PBM_SETRANGE32, 0, 100);
 
-    ListView_SetExtendedListViewStyle(gList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+    SetWindowTheme(gTree, L"Explorer", nullptr);
+    SetWindowTheme(gList, L"Explorer", nullptr);
+
+    SHFILEINFOW sfi{};
+    HIMAGELIST sysSmall = reinterpret_cast<HIMAGELIST>(
+        SHGetFileInfoW(L"C:\\", 0, &sfi, sizeof(sfi),
+                       SHGFI_SYSICONINDEX | SHGFI_SMALLICON));
+    if (sysSmall != nullptr) {
+        TreeView_SetImageList(gTree, sysSmall, TVSIL_NORMAL);
+        ListView_SetImageList(gList, sysSmall, LVSIL_SMALL);
+    }
+
+    gOriginalSearchProc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(gSearch, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(searchEditProc)));
+
+    ListView_SetExtendedListViewStyle(gList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
     LVCOLUMNW column{};
     column.mask = LVCF_TEXT | LVCF_WIDTH;
     column.pszText = const_cast<wchar_t*>(L"Name");
@@ -1905,9 +2170,10 @@ void layoutControls(HWND window) {
     const auto statusHeight = statusRect.bottom - statusRect.top;
     const auto width = rect.right - rect.left;
     const auto height = rect.bottom - rect.top - statusHeight;
-    const auto treeWidth = width / 3;
+    const auto treeWidth = std::clamp(gTreeWidth, 120, std::max(120, static_cast<int>(width) - 200));
+    gTreeWidth = treeWidth;
 
-    const LONG progressWidth = 260;
+    const LONG progressWidth = 200;
     const auto statusTextWidth = std::max<LONG>(0, width - progressWidth - 8);
     int statusParts[2] = {static_cast<int>(statusTextWidth), -1};
     SendMessageW(gStatus, SB_SETPARTS, 2, reinterpret_cast<LPARAM>(statusParts));
@@ -1923,12 +2189,12 @@ void layoutControls(HWND window) {
     constexpr int searchHeight = 28;
     MoveWindow(gTree, 0, 0, treeWidth, height, TRUE);
     constexpr LONG searchButtonWidth = 76;
-    MoveWindow(gSearch, treeWidth + 4, 4,
-               std::max<LONG>(0, width - treeWidth - searchButtonWidth - 12),
+    MoveWindow(gSearch, treeWidth + 6, 4,
+               std::max<LONG>(0, width - treeWidth - searchButtonWidth - 14),
                searchHeight - 8, TRUE);
     MoveWindow(gSearchButton, width - searchButtonWidth - 4, 3,
                searchButtonWidth, searchHeight - 6, TRUE);
-    MoveWindow(gList, treeWidth, searchHeight, width - treeWidth,
+    MoveWindow(gList, treeWidth + 4, searchHeight, width - treeWidth - 4,
                std::max<LONG>(0, height - searchHeight), TRUE);
 }
 
@@ -2080,16 +2346,122 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         case IDM_TOOLS_SERVER_CONFIG:
             editServerConfiguration();
             break;
+        case IDM_TOOLS_DEFRAGMENT:
+            defragmentArchive();
+            break;
         case IDM_HELP_MD5:
             showMd5Helper();
             break;
         case IDM_HELP_ABOUT:
             showAbout();
             break;
+        case IDM_FOCUS_SEARCH:
+            SetFocus(gSearch);
+            SendMessageW(gSearch, EM_SETSEL, 0, -1);
+            break;
+        case IDM_VIEW_REFRESH:
+            if (gLoaded) {
+                populateTree();
+                populateList(gCurrentFolder);
+            }
+            break;
+        case IDM_CONTEXT_EDIT:
+            if (const auto selected = selectedArchivePath()) {
+                if (const auto info = gArchive.find(*selected)) {
+                    editTextEntry(*info);
+                }
+            }
+            break;
+        case IDM_CONTEXT_EXTRACT:
+            if (const auto selected = selectedArchivePath()) {
+                extractPath(*selected, true, false);
+            }
+            break;
+        case IDM_CONTEXT_REPLACE:
+            if (const auto selected = selectedArchivePath()) {
+                importFileOver(*selected);
+            }
+            break;
+        case IDM_CONTEXT_DELETE:
+            deleteSelected();
+            break;
+        case IDM_CONTEXT_COPY_PATH:
+            if (const auto selected = selectedArchivePath()) {
+                copyTextToClipboard(toWide(*selected));
+                setStatus(L"Copied path to clipboard: " + toWide(*selected));
+            }
+            break;
+        case IDM_CONTEXT_IMPORT_FILE:
+            if (const auto selected = selectedArchivePath()) {
+                importFileIntoFolder(*selected);
+            } else {
+                importFileIntoFolder(gCurrentFolder);
+            }
+            break;
+        case IDM_CONTEXT_IMPORT_FOLDER:
+            if (const auto selected = selectedArchivePath()) {
+                importFolderIntoFolder(*selected);
+            } else {
+                importFolderIntoFolder(gCurrentFolder);
+            }
+            break;
         default:
             break;
         }
         return 0;
+    case WM_SETCURSOR:
+        if (reinterpret_cast<HWND>(wParam) == window && LOWORD(lParam) == HTCLIENT) {
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(window, &pt);
+            if (pt.x >= gTreeWidth && pt.x <= gTreeWidth + 6) {
+                SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+                return TRUE;
+            }
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    case WM_LBUTTONDOWN: {
+        const int x = GET_X_LPARAM(lParam);
+        if (x >= gTreeWidth - 2 && x <= gTreeWidth + 6) {
+            gDraggingSplitter = true;
+            SetCapture(window);
+            return 0;
+        }
+        break;
+    }
+    case WM_MOUSEMOVE: {
+        if (gDraggingSplitter) {
+            RECT rc{};
+            GetClientRect(window, &rc);
+            const int width = rc.right - rc.left;
+            const int x = GET_X_LPARAM(lParam);
+            gTreeWidth = std::clamp(x, 120, std::max(120, width - 200));
+            layoutControls(window);
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        if (gDraggingSplitter) {
+            gDraggingSplitter = false;
+            ReleaseCapture();
+            return 0;
+        }
+        break;
+    }
+    case WM_CONTEXTMENU: {
+        HWND target = reinterpret_cast<HWND>(wParam);
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+        if (target == gTree) {
+            showTreeContextMenu(gTree, x, y);
+            return 0;
+        } else if (target == gList) {
+            showListContextMenu(gList, x, y);
+            return 0;
+        }
+        return 0;
+    }
     case WM_DROPFILES:
         handleDropFiles(reinterpret_cast<HDROP>(wParam));
         return 0;
@@ -2152,8 +2524,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         PostQuitMessage(0);
         return 0;
     default:
-        return DefWindowProcW(window, message, wParam, lParam);
+        break;
     }
+    return DefWindowProcW(window, message, wParam, lParam);
 }
 
 } // namespace
@@ -2207,10 +2580,14 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int showCommand) {
     ShowWindow(gMain, showCommand);
     UpdateWindow(gMain);
 
+    HACCEL accelerators = LoadAcceleratorsW(instance, MAKEINTRESOURCEW(IDR_ACCELERATOR));
+
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
+        if (accelerators == nullptr || !TranslateAcceleratorW(gMain, accelerators, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
     }
     const auto exitCode = static_cast<int>(message.wParam);
     OleUninitialize();

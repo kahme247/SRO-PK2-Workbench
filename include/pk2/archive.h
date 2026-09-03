@@ -94,6 +94,7 @@ public:
     void deleteEntry(const std::string& archivePath);
 
     void save();
+    void saveDefragmented();
     void saveAs(const std::filesystem::path& outputPath);
 
 private:
@@ -105,6 +106,7 @@ private:
     const Node* findNode(const std::string& archivePath) const;
     Node* ensureFolder(const std::string& archivePath);
     EntryInfo makeInfo(const Node& node) const;
+    bool saveInPlace();
     void writeArchive(const std::filesystem::path& outputPath) const;
 
     std::unique_ptr<Node> root_;
@@ -113,6 +115,9 @@ private:
     std::string password_;
     CryptoMode cryptoMode_;
     bool dirty_{false};
+    // Set by structural changes (entry deletion, new folders) that alter
+    // directory-block layout and cannot be persisted by an in-place append.
+    bool structureDirty_{false};
 };
 
 } // namespace pk2

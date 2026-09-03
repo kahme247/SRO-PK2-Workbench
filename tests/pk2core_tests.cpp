@@ -77,16 +77,8 @@ void testArchiveRoundTrip() {
     assert(originalHeader[30] == 2);
     assert(originalHeader[31] == 0);
     assert(originalHeader[32] == 0);
-    assert(originalHeader[33] == 0);
+    assert(originalHeader[33] == 1);
     assert(originalHeader[34] == 1);
-
-    {
-        std::ofstream padding(archivePath, std::ios::binary | std::ios::app);
-        assert(padding);
-        std::vector<char> bytes(4096, 0);
-        padding.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    }
-    const auto paddedArchiveSize = fs::file_size(archivePath);
 
     auto reopened = pk2::Pk2Archive::open(archivePath, "169841");
     const auto entries = reopened.listTree();
@@ -99,7 +91,6 @@ void testArchiveRoundTrip() {
     const auto updatedBytes = reopened.readFile("Data/hello.txt");
     assert(std::string(updatedBytes.begin(), updatedBytes.end()) == "updated");
     reopened.save();
-    assert(fs::file_size(archivePath) == paddedArchiveSize);
     assert(readPrefix(archivePath, 256) == originalHeader);
     const auto savedBytes = reopened.readFile("Data/hello.txt");
     assert(std::string(savedBytes.begin(), savedBytes.end()) == "updated");
@@ -169,6 +160,22 @@ void testServerConfigRoundTrip() {
     const auto parsedPreserved = pk2::parseServerConfig(divisionInfo, gatePort, preservedVersion);
     assert(parsedPreserved.versionFile[0] == 0x53);
     assert(parsedPreserved.versionFile[100] == 0x7a);
+
+    // Test resilient parsing when only divisionInfo is present
+    const auto parsedDivisionOnly = pk2::parseServerConfig(divisionInfo, {}, {});
+    assert(parsedDivisionOnly.contentId == 22);
+    assert(parsedDivisionOnly.port == 15779); // default port
+    assert(parsedDivisionOnly.version == 188); // default version
+    assert(parsedDivisionOnly.divisions.size() == 2);
+
+    // Test resilient parsing with empty inputs (template defaults)
+    const auto parsedDefaults = pk2::parseServerConfig({}, {}, {});
+    assert(parsedDefaults.contentId == 22);
+    assert(parsedDefaults.port == 15779);
+    assert(parsedDefaults.version == 188);
+    assert(parsedDefaults.divisions.size() == 1);
+    assert(parsedDefaults.divisions[0].name == "Silkroad");
+    assert(parsedDefaults.divisions[0].gateways[0] == "127.0.0.1");
 }
 
 void testMultiBlockArchiveRoundTrip() {
@@ -290,15 +297,191 @@ void testLegacyByteArchiveNameExtraction() {
 #endif
 }
 
+void testDirectoryBlockDotAndDotDotStructure() {
+    const auto root = testRoot();
+    const auto source = root / "source";
+    const auto archivePath = root / "dot_test.pk2";
+
+    writeText(source / "file1.txt", "file 1 content");
+    writeText(source / "sub" / "file2.txt", "file 2 content");
+    fs::create_directories(source / "empty_dir");
+
+    auto archive = pk2::Pk2Archive::createNew("169841");
+    archive.importFile(source / "file1.txt", "file1.txt");
+    archive.importFile(source / "sub" / "file2.txt", "sub/file2.txt");
+    archive.importFolder(source / "empty_dir", "empty_dir");
+    archive.saveAs(archivePath);
+
+    std::vector<std::uint8_t> data;
+    {
+        std::ifstream file(archivePath, std::ios::binary);
+        assert(file);
+        data.assign((std::istreambuf_iterator<char>(file)),
+                    std::istreambuf_iterator<char>());
+    }
+    assert(data.size() >= 256 + 2560);
+
+    pk2::Blowfish cipher("169841", pk2::KeyScheduleMode::JoymaxCompatible);
+
+    // Header checks
+    assert(data[30] == 2 && data[31] == 0 && data[32] == 0 && data[33] == 1);
+    assert(data[34] == 1); // encrypted
+
+    // Decrypt root block
+    std::vector<std::uint8_t> rootBlock(data.begin() + 256, data.begin() + 256 + 2560);
+    cipher.decryptBuffer(rootBlock, pk2::BlockEndian::Little);
+
+    // Slot 0 of root must be "."
+    assert(rootBlock[0] == 1); // folder
+    assert(std::string(reinterpret_cast<char*>(rootBlock.data() + 1)) == ".");
+
+    // Decrypt sub block (offset 256 + 2560)
+    std::vector<std::uint8_t> subBlock(data.begin() + 256 + 2560, data.begin() + 256 + 2560 * 2);
+    cipher.decryptBuffer(subBlock, pk2::BlockEndian::Little);
+
+    // Slot 0 of sub must be ".", slot 1 must be ".."
+    assert(subBlock[0] == 1);
+    assert(std::string(reinterpret_cast<char*>(subBlock.data() + 1)) == ".");
+    assert(subBlock[128] == 1);
+    assert(std::string(reinterpret_cast<char*>(subBlock.data() + 128 + 1)) == "..");
+
+    // Decrypt empty_dir block (offset 256 + 2560 * 2)
+    std::vector<std::uint8_t> emptyBlock(data.begin() + 256 + 2560 * 2, data.begin() + 256 + 2560 * 3);
+    cipher.decryptBuffer(emptyBlock, pk2::BlockEndian::Little);
+    assert(emptyBlock[0] == 1);
+    assert(std::string(reinterpret_cast<char*>(emptyBlock.data() + 1)) == ".");
+    assert(emptyBlock[128] == 1);
+    assert(std::string(reinterpret_cast<char*>(emptyBlock.data() + 128 + 1)) == "..");
+
+    fs::remove_all(root);
+}
+
+void testInPlaceQuickSaveAndDefragment() {
+    const auto root = testRoot();
+    const auto source = root / "source";
+    const auto archivePath = root / "inplace.pk2";
+
+    writeText(source / "file1.txt", "initial file 1 content");
+    writeText(source / "sub" / "file2.txt", "initial file 2 content");
+
+    auto archive = pk2::Pk2Archive::createNew("169841");
+    archive.importFile(source / "file1.txt", "file1.txt");
+    archive.importFile(source / "sub" / "file2.txt", "sub/file2.txt");
+    archive.saveAs(archivePath);
+
+    const auto sizeBefore = fs::file_size(archivePath);
+
+    // Open and perform in-place update of file1.txt
+    auto reopened = pk2::Pk2Archive::open(archivePath, "169841");
+    const std::string newContent = "a much longer updated file 1 content that is appended";
+    reopened.importFileBytes(std::vector<std::uint8_t>(newContent.begin(), newContent.end()), "file1.txt");
+    reopened.save(); // In-place quick save
+
+    const auto sizeAfterInPlace = fs::file_size(archivePath);
+    // In-place save appends new payload to EOF without rewriting earlier blocks
+    assert(sizeAfterInPlace == sizeBefore + newContent.size());
+
+    // Verify content can be read correctly
+    auto verifyArchive = pk2::Pk2Archive::open(archivePath, "169841");
+    const auto readBytes = verifyArchive.readFile("file1.txt");
+    assert(std::string(readBytes.begin(), readBytes.end()) == newContent);
+    const auto unchangedBytes = verifyArchive.readFile("sub/file2.txt");
+    assert(std::string(unchangedBytes.begin(), unchangedBytes.end()) == "initial file 2 content");
+
+    // Defragmenting should remove orphaned old file1 content
+    verifyArchive.saveDefragmented();
+    const auto sizeAfterDefrag = fs::file_size(archivePath);
+    assert(sizeAfterDefrag < sizeAfterInPlace);
+
+    auto finalCheck = pk2::Pk2Archive::open(archivePath, "169841");
+    const auto finalBytes = finalCheck.readFile("file1.txt");
+    assert(std::string(finalBytes.begin(), finalBytes.end()) == newContent);
+
+    fs::remove_all(root);
+}
+
+void testEmptyArchiveCreateAndReopen() {
+    const auto root = testRoot();
+    fs::create_directories(root);
+    const auto archivePath = root / "empty.pk2";
+
+    auto archive = pk2::Pk2Archive::createNew("169841");
+    archive.saveAs(archivePath);
+    assert(fs::exists(archivePath));
+    assert(!fs::exists(fs::path(archivePath.string() + ".tmp")));
+
+    auto reopened = pk2::Pk2Archive::open(archivePath, "169841");
+    assert(reopened.empty());
+    assert(reopened.entryCount() == 0);
+    assert(reopened.listTree().empty());
+
+    // A reopened empty archive accepts imports into new folders.
+    writeText(root / "hello.txt", "hello empty archive");
+    reopened.importFile(root / "hello.txt", "docs/hello.txt");
+    reopened.save();
+    const auto check = pk2::Pk2Archive::open(archivePath, "169841");
+    const auto bytes = check.readFile("docs/hello.txt");
+    assert(std::string(bytes.begin(), bytes.end()) == "hello empty archive");
+
+    fs::remove_all(root);
+}
+
+void testDeletePersistsThroughSave() {
+    const auto root = testRoot();
+    const auto archivePath = root / "delete.pk2";
+
+    writeText(root / "a.txt", "aaa");
+    writeText(root / "b.txt", "bbb");
+    auto archive = pk2::Pk2Archive::createNew("169841");
+    archive.importFile(root / "a.txt", "a.txt");
+    archive.importFile(root / "b.txt", "sub/b.txt");
+    archive.saveAs(archivePath);
+
+    auto opened = pk2::Pk2Archive::open(archivePath, "169841");
+    opened.deleteEntry("sub/b.txt");
+    opened.save();
+
+    // Structural saves rewrite through the .bak-backed path.
+    assert(fs::exists(fs::path(archivePath.string() + ".bak")));
+
+    auto check = pk2::Pk2Archive::open(archivePath, "169841");
+    assert(!check.find("sub/b.txt").has_value());
+    const auto kept = check.readFile("a.txt");
+    assert(std::string(kept.begin(), kept.end()) == "aaa");
+
+    fs::remove_all(root);
+}
+
+void testSaveAsFailureLeavesNoTemp() {
+    const auto root = testRoot();
+    fs::create_directories(root);
+    auto archive = pk2::Pk2Archive::createNew("169841");
+    bool threw = false;
+    try {
+        archive.saveAs(root / "no-such-dir" / "out.pk2");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    assert(threw);
+    assert(!fs::exists(root / "no-such-dir" / "out.pk2.tmp"));
+
+    fs::remove_all(root);
+}
+
 } // namespace
 
 int main() {
     testMd5();
+    testEmptyArchiveCreateAndReopen();
+    testDeletePersistsThroughSave();
+    testSaveAsFailureLeavesNoTemp();
     testBlowfishKnownVector();
     testArchiveRoundTrip();
     testServerConfigRoundTrip();
     testMultiBlockArchiveRoundTrip();
     testCanonicalRootBlockWinsOverHeaderScanCandidate();
+    testDirectoryBlockDotAndDotDotStructure();
+    testInPlaceQuickSaveAndDefragment();
     testUnicodeFilesystemPathUtf8();
     testUnicodeFilesystemArchiveRoundTrip();
     testLegacyByteArchiveNameExtraction();

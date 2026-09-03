@@ -44,8 +44,8 @@ build\Release\pk2cli.exe md5 "private server blowfish key"
 - File sizes are shown with readable units: `B`, `KB`, `MB`, and `GB`.
 - `Extract Shown` writes into a folder named after the archive stem. For example, extracting from `Data.pk2` into `C:\out` writes under `C:\out\Data`.
 - Files and folders can be dragged onto the window to import them into the currently selected archive folder.
-- Imports, drag-and-drop changes, deletions, and Server Configuration updates are saved automatically. Each save retains the existing `.bak` safety backup behavior.
-- Normal saves preserve the archive's existing physical size when the rewritten content is smaller, avoiding unexpected shrinkage from compaction.
+- Imports, drag-and-drop changes, deletions, and Server Configuration updates are saved automatically. Structural saves (deletions, new folders, defragment, Save As) rewrite the archive and write a `.bak` safety backup first; plain content replacements are appended in place without a fresh `.bak`.
+- In-place saves only grow the archive, so normal saves never shrink it unexpectedly; use `Tools > Defragment` (which takes a `.bak` backup) to compact orphaned bytes.
 - Files and folders can be dragged out of the list/tree into Explorer to extract them by shell copy.
 - Opening, extracting, and importing run on background worker threads with a status-bar progress bar, so large operations should not freeze the window.
 - Windows filesystem paths are converted through UTF-8 helpers, so non-ANSI folder and file names can be used without code-page conversion errors.

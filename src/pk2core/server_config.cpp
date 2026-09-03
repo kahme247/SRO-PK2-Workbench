@@ -120,69 +120,84 @@ std::string decryptedLegacyVersionText(std::vector<std::uint8_t> bytes, BlockEnd
 ServerConfig parseServerConfig(const std::vector<std::uint8_t>& divisionInfo,
                                const std::vector<std::uint8_t>& gatePort,
                                const std::vector<std::uint8_t>& encryptedVersion) {
-    if (divisionInfo.size() < 2) {
-        throw Pk2Error("DIVISIONINFO.TXT is truncated.");
-    }
-
     ServerConfig config;
-    std::size_t offset = 0;
-    config.contentId = divisionInfo[offset++];
-    const auto divisionCount = divisionInfo[offset++];
-    for (std::size_t i = 0; i < divisionCount; ++i) {
-        ServerDivision division;
-        division.name = readSizedString(divisionInfo, offset);
-        if (offset >= divisionInfo.size()) {
-            throw Pk2Error("DIVISIONINFO.TXT is missing a gateway count.");
+    config.contentId = 22;
+    config.port = 15779;
+    config.version = 188;
+
+    if (!divisionInfo.empty()) {
+        if (divisionInfo.size() < 2) {
+            throw Pk2Error("DIVISIONINFO.TXT is truncated.");
         }
-        const auto gatewayCount = divisionInfo[offset++];
-        for (std::size_t gateway = 0; gateway < gatewayCount; ++gateway) {
-            division.gateways.push_back(readSizedString(divisionInfo, offset));
+
+        std::size_t offset = 0;
+        config.contentId = divisionInfo[offset++];
+        const auto divisionCount = divisionInfo[offset++];
+        for (std::size_t i = 0; i < divisionCount; ++i) {
+            ServerDivision division;
+            division.name = readSizedString(divisionInfo, offset);
+            if (offset >= divisionInfo.size()) {
+                throw Pk2Error("DIVISIONINFO.TXT is missing a gateway count.");
+            }
+            const auto gatewayCount = divisionInfo[offset++];
+            for (std::size_t gateway = 0; gateway < gatewayCount; ++gateway) {
+                division.gateways.push_back(readSizedString(divisionInfo, offset));
+            }
+            config.divisions.push_back(std::move(division));
         }
-        config.divisions.push_back(std::move(division));
     }
+
     if (config.divisions.empty()) {
-        throw Pk2Error("DIVISIONINFO.TXT does not contain a division.");
+        config.divisions = {{"Silkroad", {"127.0.0.1"}}};
     }
 
-    std::string portText;
-    for (const auto byte : gatePort) {
-        if (byte == 0 || std::isspace(byte) != 0) {
-            continue;
+    if (!gatePort.empty()) {
+        std::string portText;
+        for (const auto byte : gatePort) {
+            if (byte == 0 || std::isspace(byte) != 0) {
+                continue;
+            }
+            portText.push_back(static_cast<char>(byte));
         }
-        portText.push_back(static_cast<char>(byte));
+        if (!portText.empty()) {
+            const auto port = parseDecimal(portText, "GATEPORT.TXT");
+            if (port == 0 || port > 65535) {
+                throw Pk2Error("GATEPORT.TXT must contain a port from 1 to 65535.");
+            }
+            config.port = static_cast<std::uint16_t>(port);
+        }
     }
-    const auto port = parseDecimal(portText, "GATEPORT.TXT");
-    if (port == 0 || port > 65535) {
-        throw Pk2Error("GATEPORT.TXT must contain a port from 1 to 65535.");
-    }
-    config.port = static_cast<std::uint16_t>(port);
 
-    if (encryptedVersion.size() != kVersionFileSize) {
-        throw Pk2Error("SV.T must be exactly 1024 bytes.");
-    }
-    config.versionFile = encryptedVersion;
-    auto versionText = decryptedVersionBlock(encryptedVersion, BlockEndian::Little);
-    if (!versionText.empty()) {
-        config.versionEndian = BlockEndian::Little;
-    } else {
-        versionText = decryptedVersionBlock(encryptedVersion, BlockEndian::Big);
+    if (!encryptedVersion.empty()) {
+        if (encryptedVersion.size() != kVersionFileSize) {
+            throw Pk2Error("SV.T must be exactly 1024 bytes.");
+        }
+        config.versionFile = encryptedVersion;
+        auto versionText = decryptedVersionBlock(encryptedVersion, BlockEndian::Little);
         if (!versionText.empty()) {
-            config.versionEndian = BlockEndian::Big;
+            config.versionEndian = BlockEndian::Little;
         } else {
-            config.versionBlockAtOffset4 = false;
-            versionText = decryptedLegacyVersionText(encryptedVersion, BlockEndian::Little);
+            versionText = decryptedVersionBlock(encryptedVersion, BlockEndian::Big);
             if (!versionText.empty()) {
-                config.versionEndian = BlockEndian::Little;
-            } else {
-                versionText = decryptedLegacyVersionText(encryptedVersion, BlockEndian::Big);
-                if (versionText.empty()) {
-                    throw Pk2Error("SV.T could not be decrypted with the SILKROAD version key.");
-                }
                 config.versionEndian = BlockEndian::Big;
+            } else {
+                config.versionBlockAtOffset4 = false;
+                versionText = decryptedLegacyVersionText(encryptedVersion, BlockEndian::Little);
+                if (!versionText.empty()) {
+                    config.versionEndian = BlockEndian::Little;
+                } else {
+                    versionText = decryptedLegacyVersionText(encryptedVersion, BlockEndian::Big);
+                    if (versionText.empty()) {
+                        throw Pk2Error("SV.T could not be decrypted with the SILKROAD version key.");
+                    }
+                    config.versionEndian = BlockEndian::Big;
+                }
             }
         }
+        config.version = parseDecimal(versionText, "SV.T version");
+    } else {
+        config.versionFile.assign(kVersionFileSize, 0);
     }
-    config.version = parseDecimal(versionText, "SV.T version");
     return config;
 }
 

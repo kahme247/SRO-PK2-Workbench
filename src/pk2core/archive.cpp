@@ -36,6 +36,10 @@ struct Pk2Archive::Node {
     Node* parent{};
     std::vector<std::unique_ptr<Node>> children;
 
+    std::uint64_t blockOffset{};
+    std::size_t slotIndex{};
+    std::uint64_t folderFirstBlockOffset{};
+
     std::uint64_t sourceOffset{};
     std::uint64_t size{};
     std::vector<std::uint8_t> importedData;
@@ -211,14 +215,6 @@ std::vector<std::uint8_t> readAllBytes(const fs::path& path,
     return bytes;
 }
 
-std::vector<std::uint8_t> readAllBytes(const fs::path& path) {
-    std::uint64_t completed = 0;
-    const auto total = isRegularFileChecked(path, "Could not inspect input file")
-                           ? fileSizeChecked(path, "Could not read file size")
-                           : 0;
-    return readAllBytes(path, completed, total, pathFileNameUtf8(path), {});
-}
-
 class ArchiveReader {
 public:
     explicit ArchiveReader(fs::path path)
@@ -313,6 +309,19 @@ DiskEntry readDiskEntry(const std::vector<std::uint8_t>& block, std::size_t slot
     entry.size = readU32Le(block.data() + base + kEntrySizeOffset);
     entry.nextBlock = readU64Le(block.data() + base + kEntryNextBlockOffset);
     return entry;
+}
+
+bool rootBlockHasSelfEntry(const std::vector<std::uint8_t>& decodedRoot) {
+    if (decodedRoot.size() != kEntryBlockSize) {
+        return false;
+    }
+    for (std::size_t i = 0; i < kEntriesPerBlock; ++i) {
+        const auto entry = readDiskEntry(decodedRoot, i);
+        if (entry.type == 1 && entry.name == ".") {
+            return true;
+        }
+    }
+    return false;
 }
 
 int scoreEntryBlock(const std::vector<std::uint8_t>& block, std::uint64_t archiveSize) {
@@ -467,9 +476,22 @@ std::vector<std::uint64_t> rootOffsetCandidates(const std::vector<std::uint8_t>&
     return candidates;
 }
 
+bool equalsCaseInsensitive(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 Pk2Archive::Node* childByName(Pk2Archive::Node& folder, const std::string& name) {
     for (auto& child : folder.children) {
-        if (child->name == name) {
+        if (equalsCaseInsensitive(child->name, name)) {
             return child.get();
         }
     }
@@ -600,6 +622,10 @@ struct ArchiveIo {
             return;
         }
 
+        if (&parent == archive.root_.get()) {
+            parent.folderFirstBlockOffset = blockOffset;
+        }
+
         const auto raw = readRawBlock(reader, blockOffset);
         const auto decoded = decodeWithMode(raw, archive.cryptoMode_, cipher);
         if (scoreEntryBlock(decoded, reader.size()) < 0) {
@@ -612,7 +638,7 @@ struct ArchiveIo {
             if (entry.type == 0) {
                 continue;
             }
-            if (entry.nextBlock != 0) {
+            if (entry.nextBlock != 0 && (i == kEntriesPerBlock - 1 || chainedBlocks.empty())) {
                 chainedBlocks.push_back(entry.nextBlock);
             }
             if (isReservedEntryName(entry.name)) {
@@ -623,7 +649,12 @@ struct ArchiveIo {
             node->type = entry.type == 1 ? EntryType::Folder : EntryType::File;
             node->name = entry.name;
             node->parent = &parent;
+            node->blockOffset = blockOffset;
+            node->slotIndex = i;
             node->sourceOffset = entry.position;
+            if (entry.type == 1) {
+                node->folderFirstBlockOffset = entry.position;
+            }
             node->size = entry.size;
             auto* inserted = node.get();
             parent.children.push_back(std::move(node));
@@ -709,10 +740,14 @@ Pk2Archive Pk2Archive::open(const fs::path& path, std::string password) {
     }
 
     archive.cryptoMode_ = rootBlock->mode;
+    // A valid root block holding only the "." self entry is a genuine empty
+    // archive (e.g. freshly created). Anything else with no decodable
+    // children is still treated as a wrong password or corrupt file.
+    const bool rootSelfEntry = rootBlockHasSelfEntry(rootBlock->bytes);
     auto cipher = makeCipher(archive.password_, archive.cryptoMode_);
     std::set<std::uint64_t> visited;
     ArchiveIo::parseBlock(archive, reader, cipher.get(), rootOffset, *archive.root_, visited);
-    if (archive.root_->children.empty()) {
+    if (archive.root_->children.empty() && !rootSelfEntry) {
         throw Pk2Error("PK2 opened, but no root entries were decoded. The password or PK2 key derivation is probably wrong.");
     }
     archive.dirty_ = false;
@@ -784,27 +819,6 @@ std::optional<EntryInfo> Pk2Archive::find(const std::string& archivePath) const 
         return std::nullopt;
     }
     return makeInfo(*node);
-}
-
-void extendFileChecked(const fs::path& path, std::uint64_t minimumSize) {
-    const auto currentSize = fileSizeChecked(path, "Could not inspect rewritten archive size");
-    if (currentSize >= minimumSize) {
-        return;
-    }
-    if (minimumSize > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
-        throw Pk2Error("Requested archive size is too large for this platform.");
-    }
-
-    std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
-    if (!file) {
-        throw Pk2Error("Could not reopen rewritten archive for size preservation: " +
-                       pathUtf8(path));
-    }
-    file.seekp(static_cast<std::streamoff>(minimumSize - 1), std::ios::beg);
-    file.put('\0');
-    if (!file) {
-        throw Pk2Error("Could not preserve original archive size: " + pathUtf8(path));
-    }
 }
 
 std::vector<std::uint8_t> Pk2Archive::readFile(const std::string& archivePath) const {
@@ -892,6 +906,7 @@ Pk2Archive::Node* Pk2Archive::ensureFolder(const std::string& archivePath) {
             node->parent = current;
             child = node.get();
             current->children.push_back(std::move(node));
+            structureDirty_ = true;
         }
         if (!child->isFolder()) {
             throw Pk2Error("A file already exists at archive path: " + nodePath(*child));
@@ -1235,12 +1250,194 @@ void Pk2Archive::deleteEntry(const std::string& archivePath) {
         throw Pk2Error("Archive path was not found: " + archivePath);
     }
 
+    // Structural change only: the source file is never touched here, so a
+    // delete cannot corrupt the open archive before a .bak backup is taken.
+    // save() routes structural changes through the full rewrite path.
     auto* parent = node->parent;
     auto& siblings = parent->children;
     siblings.erase(std::remove_if(siblings.begin(), siblings.end(),
                                   [&](const auto& child) { return child.get() == node; }),
                    siblings.end());
     dirty_ = true;
+    structureDirty_ = true;
+}
+
+bool Pk2Archive::saveInPlace() {
+    if (sourcePath_.empty() || !existsChecked(sourcePath_, "Could not inspect archive")) {
+        return false;
+    }
+
+    std::vector<Node*> importedNodes;
+    std::function<void(Node&)> collect = [&](Node& node) {
+        if (node.imported) {
+            importedNodes.push_back(&node);
+        }
+        for (auto& child : node.children) {
+            collect(*child);
+        }
+    };
+    collect(*root_);
+
+    if (structureDirty_) {
+        // Folder additions and entry deletions change directory-block layout,
+        // which an EOF append cannot express. Fall back to the full rewrite,
+        // which also takes a .bak backup of the source archive.
+        return false;
+    }
+
+    if (importedNodes.empty()) {
+        dirty_ = false;
+        return true;
+    }
+
+    std::fstream file(sourcePath_, std::ios::binary | std::ios::in | std::ios::out);
+    if (!file) {
+        return false;
+    }
+
+    file.seekp(0, std::ios::end);
+    auto currentEof = static_cast<std::uint64_t>(file.tellp());
+    if (currentEof < kHeaderSize + kEntryBlockSize) {
+        return false;
+    }
+
+    auto cipher = makeCipher(password_, cryptoMode_);
+
+    auto writeBlockToDisk = [&](std::uint64_t blockOffset, std::vector<std::uint8_t>& block) {
+        if (cipher) {
+            cipher->encryptBuffer(block, endianForMode(cryptoMode_));
+        }
+        file.seekp(static_cast<std::streamoff>(blockOffset), std::ios::beg);
+        file.write(reinterpret_cast<const char*>(block.data()),
+                   static_cast<std::streamsize>(block.size()));
+        return bool(file);
+    };
+
+    auto readBlockFromDisk = [&](std::uint64_t blockOffset) -> std::vector<std::uint8_t> {
+        std::vector<std::uint8_t> block(kEntryBlockSize);
+        file.seekg(static_cast<std::streamoff>(blockOffset), std::ios::beg);
+        file.read(reinterpret_cast<char*>(block.data()), static_cast<std::streamsize>(block.size()));
+        if (file.gcount() != static_cast<std::streamsize>(block.size())) {
+            throw Pk2Error("Could not read block for in-place save.");
+        }
+        if (cipher) {
+            cipher->decryptBuffer(block, endianForMode(cryptoMode_));
+        }
+        return block;
+    };
+
+    auto writeEntryName = [](std::uint8_t* entryBase, const std::string& name) {
+        if (name.size() >= kEntryNameSize) {
+            throw Pk2Error("PK2 entry name is too long: " + name);
+        }
+        std::fill_n(entryBase + kEntryNameOffset, kEntryNameSize, 0);
+        std::copy_n(name.data(), std::min<std::size_t>(name.size(), kEntryNameSize - 1),
+                    entryBase + kEntryNameOffset);
+    };
+
+    for (auto* node : importedNodes) {
+        if (!node->isFile()) {
+            return false;
+        }
+
+        file.seekp(static_cast<std::streamoff>(currentEof), std::ios::beg);
+        if (!node->importedData.empty()) {
+            file.write(reinterpret_cast<const char*>(node->importedData.data()),
+                       static_cast<std::streamsize>(node->importedData.size()));
+        }
+        const auto newDataOffset = currentEof;
+        currentEof += node->importedData.size();
+
+        if (node->blockOffset != 0) {
+            auto block = readBlockFromDisk(node->blockOffset);
+            auto* entryBase = block.data() + node->slotIndex * kEntrySize;
+            entryBase[0] = 2;
+            writeEntryName(entryBase, node->name);
+            writeU64Le(entryBase + kEntryPositionOffset, newDataOffset);
+            writeU32Le(entryBase + kEntrySizeOffset, static_cast<std::uint32_t>(node->importedData.size()));
+            writeBlockToDisk(node->blockOffset, block);
+
+            node->sourceOffset = newDataOffset;
+            node->size = node->importedData.size();
+            node->imported = false;
+            node->importedData.clear();
+            node->importedData.shrink_to_fit();
+        } else {
+            const auto* parentFolder = node->parent != nullptr ? node->parent : root_.get();
+            const auto parentOffset = (parentFolder == root_.get()) ? kHeaderSize : parentFolder->folderFirstBlockOffset;
+            if (parentOffset == 0) {
+                return false;
+            }
+
+            std::uint64_t currBlockOffset = parentOffset;
+            bool slotFound = false;
+            while (!slotFound) {
+                auto block = readBlockFromDisk(currBlockOffset);
+                const std::size_t startSlot = (currBlockOffset == parentOffset)
+                                                  ? ((parentFolder == root_.get()) ? 1 : 2)
+                                                  : 0;
+                for (std::size_t s = startSlot; s < kEntriesPerBlock; ++s) {
+                    if (block[s * kEntrySize] == 0) {
+                        auto* entryBase = block.data() + s * kEntrySize;
+                        entryBase[0] = 2;
+                        writeEntryName(entryBase, node->name);
+                        writeU64Le(entryBase + kEntryPositionOffset, newDataOffset);
+                        writeU32Le(entryBase + kEntrySizeOffset, static_cast<std::uint32_t>(node->importedData.size()));
+                        writeU64Le(entryBase + kEntryNextBlockOffset, 0);
+                        writeBlockToDisk(currBlockOffset, block);
+
+                        node->blockOffset = currBlockOffset;
+                        node->slotIndex = s;
+                        node->sourceOffset = newDataOffset;
+                        node->size = node->importedData.size();
+                        node->imported = false;
+                        node->importedData.clear();
+                        node->importedData.shrink_to_fit();
+                        slotFound = true;
+                        break;
+                    }
+                }
+
+                if (slotFound) {
+                    break;
+                }
+
+                const auto nextChain = readU64Le(block.data() + (kEntriesPerBlock - 1) * kEntrySize + kEntryNextBlockOffset);
+                if (nextChain != 0) {
+                    currBlockOffset = nextChain;
+                } else {
+                    const auto newBlockOffset = currentEof;
+                    currentEof += kEntryBlockSize;
+
+                    writeU64Le(block.data() + (kEntriesPerBlock - 1) * kEntrySize + kEntryNextBlockOffset, newBlockOffset);
+                    writeBlockToDisk(currBlockOffset, block);
+
+                    std::vector<std::uint8_t> newBlock(kEntryBlockSize, 0);
+                    auto* entryBase = newBlock.data();
+                    entryBase[0] = 2;
+                    writeEntryName(entryBase, node->name);
+                    writeU64Le(entryBase + kEntryPositionOffset, newDataOffset);
+                    writeU32Le(entryBase + kEntrySizeOffset, static_cast<std::uint32_t>(node->importedData.size()));
+                    writeU64Le(entryBase + kEntryNextBlockOffset, 0);
+                    writeBlockToDisk(newBlockOffset, newBlock);
+
+                    node->blockOffset = newBlockOffset;
+                    node->slotIndex = 0;
+                    node->sourceOffset = newDataOffset;
+                    node->size = node->importedData.size();
+                    node->imported = false;
+                    node->importedData.clear();
+                    node->importedData.shrink_to_fit();
+                    slotFound = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    file.flush();
+    dirty_ = false;
+    return true;
 }
 
 void Pk2Archive::save() {
@@ -1248,8 +1445,22 @@ void Pk2Archive::save() {
         throw Pk2Error("This archive has no source path. Use Save As first.");
     }
 
+    try {
+        if (saveInPlace()) {
+            return;
+        }
+    } catch (...) {
+    }
+
+    saveDefragmented();
+}
+
+void Pk2Archive::saveDefragmented() {
+    if (sourcePath_.empty()) {
+        throw Pk2Error("This archive has no source path. Use Save As first.");
+    }
+
     const auto originalPath = sourcePath_;
-    const auto originalSize = fileSizeChecked(originalPath, "Could not inspect source archive size");
 
     fs::path backup = originalPath;
     backup += L".bak";
@@ -1257,39 +1468,55 @@ void Pk2Archive::save() {
 
     fs::path temp = originalPath;
     temp += L".tmp";
-    writeArchive(temp);
-    extendFileChecked(temp, originalSize);
-    auto reopened = Pk2Archive::open(temp, password_);
     try {
-        removeChecked(originalPath);
-        renameChecked(temp, originalPath);
+        writeArchive(temp);
+        auto reopened = Pk2Archive::open(temp, password_);
+        try {
+            removeChecked(originalPath);
+            renameChecked(temp, originalPath);
+        } catch (...) {
+            if (!existsChecked(originalPath, "Could not inspect source archive") &&
+                existsChecked(backup, "Could not inspect backup archive")) {
+                copyFileChecked(backup, originalPath);
+            }
+            throw;
+        }
+        reopened.sourcePath_ = originalPath;
+        *this = std::move(reopened);
     } catch (...) {
-        if (!existsChecked(originalPath, "Could not inspect source archive") &&
-            existsChecked(backup, "Could not inspect backup archive")) {
-            copyFileChecked(backup, originalPath);
+        try {
+            removeChecked(temp);
+        } catch (...) {
         }
         throw;
     }
-    reopened.sourcePath_ = originalPath;
-    *this = std::move(reopened);
 }
 
 void Pk2Archive::saveAs(const fs::path& outputPath) {
     fs::path temp = outputPath;
     temp += L".tmp";
-    writeArchive(temp);
-    auto reopened = Pk2Archive::open(temp, password_);
-    if (existsChecked(outputPath, "Could not inspect output archive")) {
-        removeChecked(outputPath);
+    try {
+        writeArchive(temp);
+        auto reopened = Pk2Archive::open(temp, password_);
+        if (existsChecked(outputPath, "Could not inspect output archive")) {
+            removeChecked(outputPath);
+        }
+        renameChecked(temp, outputPath);
+        reopened.sourcePath_ = outputPath;
+        *this = std::move(reopened);
+    } catch (...) {
+        try {
+            removeChecked(temp);
+        } catch (...) {
+        }
+        throw;
     }
-    renameChecked(temp, outputPath);
-    reopened.sourcePath_ = outputPath;
-    *this = std::move(reopened);
 }
 
 void Pk2Archive::writeArchive(const fs::path& outputPath) const {
     struct BlockPlan {
         const Node* folder{};
+        bool isRoot{};
         std::size_t firstChild{};
         std::uint64_t offset{};
         std::uint64_t nextOffset{};
@@ -1298,19 +1525,23 @@ void Pk2Archive::writeArchive(const fs::path& outputPath) const {
     std::vector<BlockPlan> blocks;
     std::map<const Node*, std::uint64_t> folderBlocks;
 
-    std::function<void(const Node&, bool)> allocateFolder = [&](const Node& folder, bool force) {
+    std::function<void(const Node&)> allocateFolder = [&](const Node& folder) {
+        const bool isRoot = (&folder == root_.get());
         const auto childCount = folder.children.size();
-        if (!force && childCount == 0) {
-            folderBlocks[&folder] = 0;
-            return;
+        const std::size_t firstBlockCapacity = isRoot ? 19 : 18;
+
+        std::size_t blockCount = 1;
+        if (childCount > firstBlockCapacity) {
+            blockCount = 1 + (childCount - firstBlockCapacity + (kEntriesPerBlock - 1)) / kEntriesPerBlock;
         }
 
-        const auto blockCount = std::max<std::size_t>(1, (childCount + kEntriesPerBlock - 1) / kEntriesPerBlock);
         const auto firstIndex = blocks.size();
         for (std::size_t i = 0; i < blockCount; ++i) {
             const auto offset = static_cast<std::uint64_t>(kHeaderSize + blocks.size() * kEntryBlockSize);
-            blocks.push_back({&folder, i * kEntriesPerBlock, offset, 0});
+            const std::size_t firstChild = (i == 0) ? 0 : (firstBlockCapacity + (i - 1) * kEntriesPerBlock);
+            blocks.push_back({&folder, isRoot, firstChild, offset, 0});
         }
+
         folderBlocks[&folder] = blocks[firstIndex].offset;
         for (std::size_t i = 0; i + 1 < blockCount; ++i) {
             blocks[firstIndex + i].nextOffset = blocks[firstIndex + i + 1].offset;
@@ -1318,11 +1549,11 @@ void Pk2Archive::writeArchive(const fs::path& outputPath) const {
 
         for (const auto& child : folder.children) {
             if (child->isFolder()) {
-                allocateFolder(*child, false);
+                allocateFolder(*child);
             }
         }
     };
-    allocateFolder(*root_, true);
+    allocateFolder(*root_);
 
     std::vector<const Node*> files;
     std::function<void(const Node&)> collectFiles = [&](const Node& node) {
@@ -1354,11 +1585,25 @@ void Pk2Archive::writeArchive(const fs::path& outputPath) const {
     std::array<std::uint8_t, kHeaderSize> header{};
     if (sourceHeader_.size() == kHeaderSize) {
         std::copy(sourceHeader_.begin(), sourceHeader_.end(), header.begin());
+        writeU32Le(header.data() + 30, 0x01000002);
+        header[34] = isEncryptedMode(cryptoMode_) ? 1 : 0;
     } else {
         const std::string headerName = "JoyMax File Manager!\n";
         std::copy(headerName.begin(), headerName.end(), header.begin());
-        writeU32Le(header.data() + 30, 2);
+        writeU32Le(header.data() + 30, 0x01000002);
         header[34] = isEncryptedMode(cryptoMode_) ? 1 : 0;
+    }
+
+    auto cipher = makeCipher(password_, cryptoMode_);
+
+    if (isEncryptedMode(cryptoMode_) && cipher != nullptr) {
+        std::vector<std::uint8_t> verifyBlock = {
+            'J', 'o', 'y', 'm', 'a', 'x', ' ', 'P',
+            'a', 'k', ' ', 'F', 'i', 'l', 'e', 0
+        };
+        cipher->encryptBuffer(verifyBlock, endianForMode(cryptoMode_));
+        std::copy_n(verifyBlock.begin(), std::min<std::size_t>(3, verifyBlock.size()), header.begin() + 35);
+        std::fill_n(header.begin() + 38, 13, 0);
     }
     output.write(reinterpret_cast<const char*>(header.data()), header.size());
 
@@ -1369,16 +1614,45 @@ void Pk2Archive::writeArchive(const fs::path& outputPath) const {
         std::copy(name.begin(), name.end(), entryBase + kEntryNameOffset);
     };
 
-    auto cipher = makeCipher(password_, cryptoMode_);
-
     for (const auto& plan : blocks) {
         std::vector<std::uint8_t> block(kEntryBlockSize, 0);
         const auto& children = plan.folder->children;
-        for (std::size_t slot = 0; slot < kEntriesPerBlock; ++slot) {
-            const auto childIndex = plan.firstChild + slot;
-            if (childIndex >= children.size()) {
-                break;
+        std::size_t slot = 0;
+
+        if (plan.firstChild == 0) {
+            if (plan.isRoot) {
+                // Root directory entry "."
+                auto* entryBase = block.data() + slot * kEntrySize;
+                entryBase[0] = 1;
+                writeName(entryBase, ".");
+                writeU64Le(entryBase + kEntryPositionOffset, folderBlocks.at(plan.folder));
+                writeU32Le(entryBase + kEntrySizeOffset, 0);
+                writeU64Le(entryBase + kEntryNextBlockOffset, 0);
+                slot = 1;
+            } else {
+                // Current directory entry "."
+                auto* entryBase = block.data() + slot * kEntrySize;
+                entryBase[0] = 1;
+                writeName(entryBase, ".");
+                writeU64Le(entryBase + kEntryPositionOffset, folderBlocks.at(plan.folder));
+                writeU32Le(entryBase + kEntrySizeOffset, 0);
+                writeU64Le(entryBase + kEntryNextBlockOffset, 0);
+
+                // Parent directory entry ".."
+                const auto* parentFolder = plan.folder->parent != nullptr ? plan.folder->parent : root_.get();
+                auto* parentEntryBase = block.data() + 1 * kEntrySize;
+                parentEntryBase[0] = 1;
+                writeName(parentEntryBase, "..");
+                writeU64Le(parentEntryBase + kEntryPositionOffset, folderBlocks.at(parentFolder));
+                parentEntryBase[kEntrySizeOffset] = 0;
+                writeU64Le(parentEntryBase + kEntryNextBlockOffset, 0);
+
+                slot = 2;
             }
+        }
+
+        std::size_t childIndex = plan.firstChild;
+        while (slot < kEntriesPerBlock && childIndex < children.size()) {
             const auto& child = *children[childIndex];
             auto* entryBase = block.data() + slot * kEntrySize;
             entryBase[0] = child.isFolder() ? 1 : 2;
@@ -1390,7 +1664,15 @@ void Pk2Archive::writeArchive(const fs::path& outputPath) const {
                 writeU64Le(entryBase + kEntryPositionOffset, fileOffsets.at(&child));
                 writeU32Le(entryBase + kEntrySizeOffset, static_cast<std::uint32_t>(child.size));
             }
-            writeU64Le(entryBase + kEntryNextBlockOffset, plan.nextOffset);
+            writeU64Le(entryBase + kEntryNextBlockOffset, 0);
+
+            ++slot;
+            ++childIndex;
+        }
+
+        if (plan.nextOffset != 0) {
+            writeU64Le(block.data() + (kEntriesPerBlock - 1) * kEntrySize + kEntryNextBlockOffset,
+                       plan.nextOffset);
         }
 
         if (cipher) {

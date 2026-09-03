@@ -30,6 +30,7 @@ BEGIN
     POPUP "&Tools"
     BEGIN
         MENUITEM "&Server Configuration...", IDM_TOOLS_SERVER_CONFIG
+        MENUITEM "&Defragment / Optimize PK2...", IDM_TOOLS_DEFRAGMENT
         MENUITEM "Private-server MD&5 Helper", IDM_HELP_MD5
         MENUITEM SEPARATOR
         MENUITEM "&About PK2 Workbench PRO", IDM_HELP_ABOUT
@@ -92,4 +93,14 @@ BEGIN
              WS_VSCROLL | WS_HSCROLL | WS_TABSTOP
     DEFPUSHBUTTON "Save", IDOK, 514, 386, 48, 16
     PUSHBUTTON "Cancel", IDCANCEL, 565, 386, 48, 16
+END
+
+IDR_ACCELERATOR ACCELERATORS
+BEGIN
+    "O",            IDM_FILE_OPEN,          VIRTKEY, CONTROL
+    "S",            IDM_FILE_SAVE,          VIRTKEY, CONTROL
+    "S",            IDM_FILE_SAVE_AS,       VIRTKEY, CONTROL, SHIFT
+    "F",            IDM_FOCUS_SEARCH,       VIRTKEY, CONTROL
+    VK_F5,          IDM_VIEW_REFRESH,       VIRTKEY
+    VK_DELETE,      IDM_DELETE_ENTRY,       VIRTKEY
 END

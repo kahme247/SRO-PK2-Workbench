@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 2026-09-03
+
+### Integrity fixes
+
+- Creating a new empty archive now produces an openable file; `open` accepts a valid root block holding only the `.` self entry instead of rejecting it as a wrong password, and still rejects undecodable blocks as before.
+- Deleting an entry no longer touches the source file before saving. Deletions are structural changes persisted through the `.bak`-backed full-rewrite path, so a reported "deleted and saved" is always durable and the input of `delete <src> <path> <dst>` is never modified.
+- Failed `Save As` / defragment operations now remove their orphan `.tmp` scratch file instead of leaving it beside the archive.
+- Added regression coverage for empty-archive round trips, delete persistence with `.bak`, and `.tmp` cleanup on save failure.
+
 ## 0.3.0 - 2026-07-24
 
 ### Highlights

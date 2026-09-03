@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(PK2WorkbenchPRO
-    VERSION 0.3.0
+    VERSION 0.3.1
     DESCRIPTION "PK2 Workbench PRO by kahme247"
     LANGUAGES CXX)
 
@@ -34,8 +34,11 @@ if(WIN32)
     add_executable(pk2win WIN32
         apps/pk2win/main.cpp
         apps/pk2win/pk2win.rc)
-    target_link_libraries(pk2win PRIVATE pk2core comctl32 shell32 comdlg32 ole32)
+    target_link_libraries(pk2win PRIVATE pk2core comctl32 shell32 comdlg32 ole32 uxtheme)
     target_compile_definitions(pk2win PRIVATE UNICODE _UNICODE)
+    if(MINGW)
+        target_link_options(pk2win PRIVATE -municode)
+    endif()
 endif()
 
 enable_testing()
